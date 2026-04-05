@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme, truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
+import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
@@ -50,7 +50,7 @@ interface AgentResult {
 	exitCode: number;
 	progress: AgentProgress;
 	model?: string;
-	usage: { input: number; output: number; cost: number; turns: number };
+	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
 }
 
 interface Details {
@@ -68,7 +68,6 @@ const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
-const VALID_AGENTS = ["scout", "researcher", "worker"];
 const DEFAULT_MAX_CONCURRENCY = 4;
 
 function loadConfig(): ExtensionConfig {
@@ -84,33 +83,12 @@ function loadConfig(): ExtensionConfig {
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
 // Custom tools that require loading an extension into the subagent process
+const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-	web_search: path.join(TOOLS_DIR, "web-tools.ts"),
-	web_fetch: path.join(TOOLS_DIR, "web-tools.ts"),
+	web_search: path.join(EXT_BASE, "web-search", "index.ts"),
+	web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
 	safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
 };
-
-// ── Frontmatter Parsing ───────────────────────────────────────────────
-
-function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
-	const frontmatter: Record<string, string> = {};
-	const normalized = content.replace(/\r\n/g, "\n");
-	if (!normalized.startsWith("---")) return { frontmatter, body: normalized };
-	const endIndex = normalized.indexOf("\n---", 3);
-	if (endIndex === -1) return { frontmatter, body: normalized };
-	const block = normalized.slice(4, endIndex);
-	const body = normalized.slice(endIndex + 4).trim();
-	for (const line of block.split("\n")) {
-		const match = line.match(/^([\w-]+):\s*(.*)$/);
-		if (match) {
-			let value = match[2].trim();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-				value = value.slice(1, -1);
-			frontmatter[match[1]] = value;
-		}
-	}
-	return { frontmatter, body };
-}
 
 // ── Agent Discovery ───────────────────────────────────────────────────
 
@@ -121,7 +99,7 @@ function loadAgents(): AgentConfig[] {
 		if (!entry.endsWith(".md")) continue;
 		const filePath = path.join(AGENTS_DIR, entry);
 		const content = fs.readFileSync(filePath, "utf-8");
-		const { frontmatter, body } = parseFrontmatter(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
 		if (!frontmatter.name) continue;
 		const tools = (frontmatter.tools || "")
 			.split(",")
@@ -222,17 +200,19 @@ function truncLine(text: string, maxWidth: number): string {
 
 // ── Subagent Execution ────────────────────────────────────────────────
 
-function buildPiArgs(
+async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
-): { args: string[]; tempDir: string } {
+): Promise<{ args: string[]; tempDir: string }> {
 	const piBin = resolvePiBinary();
-	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sub-"));
+	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
 	// Write system prompt to temp file
 	const promptPath = path.join(tempDir, `${agent.name}.md`);
-	fs.writeFileSync(promptPath, agent.systemPrompt, { mode: 0o600 });
+	await withFileMutationQueue(promptPath, async () => {
+		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+	});
 
 	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
 
@@ -269,7 +249,9 @@ function buildPiArgs(
 	const TASK_LIMIT = 8000;
 	if (task.length > TASK_LIMIT) {
 		const taskPath = path.join(tempDir, "task.md");
-		fs.writeFileSync(taskPath, `Task: ${task}`, { mode: 0o600 });
+		await withFileMutationQueue(taskPath, async () => {
+			await fs.promises.writeFile(taskPath, `Task: ${task}`, { encoding: "utf-8", mode: 0o600 });
+		});
 		args.push(`@${taskPath}`);
 	} else {
 		args.push(`Task: ${task}`);
@@ -307,7 +289,7 @@ async function runSubagent(
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress) => void,
 ): Promise<AgentResult> {
-	const { args, tempDir } = buildPiArgs(agent, task, cwd);
+	const { args, tempDir } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -317,7 +299,7 @@ async function runSubagent(
 		output: "",
 		exitCode: 0,
 		model: agent.model,
-		usage: { input: 0, output: 0, cost: 0, turns: 0 },
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 		progress: {
 			agent: agent.name,
 			status: "running",
@@ -333,15 +315,14 @@ async function runSubagent(
 	const startTime = Date.now();
 	const progress = result.progress;
 
-	const fireUpdate = () => {
+	const fireUpdate = throttle(() => {
 		progress.durationMs = Date.now() - startTime;
 		onUpdate?.(progress);
-	};
+	}, 150);
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const proc = spawn(command, spawnArgs, {
 			cwd,
-			env: { ...process.env, MCP_DIRECT_TOOLS: "__none__" },
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 
@@ -377,6 +358,10 @@ async function runSubagent(
 					fireUpdate();
 				}
 
+				if (evt.type === "tool_result_end") {
+					fireUpdate();
+				}
+
 				if (evt.type === "message_end" && evt.message) {
 					if (evt.message.role === "assistant") {
 						result.usage.turns++;
@@ -384,6 +369,8 @@ async function runSubagent(
 						if (u) {
 							result.usage.input += u.input || 0;
 							result.usage.output += u.output || 0;
+							result.usage.cacheRead += u.cacheRead || 0;
+							result.usage.cacheWrite += u.cacheWrite || 0;
 							result.usage.cost += u.cost?.total || 0;
 							progress.tokens = result.usage.input + result.usage.output;
 						}
@@ -469,6 +456,28 @@ async function runSubagent(
 	}
 
 	return result;
+}
+
+// ── Throttle ──────────────────────────────────────────────────────────
+
+function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
+	let lastCall = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return ((...args: any[]) => {
+		const now = Date.now();
+		const remaining = ms - (now - lastCall);
+		if (remaining <= 0) {
+			lastCall = now;
+			if (timer) { clearTimeout(timer); timer = undefined; }
+			fn(...args);
+		} else if (!timer) {
+			timer = setTimeout(() => {
+				lastCall = Date.now();
+				timer = undefined;
+				fn(...args);
+			}, remaining);
+		}
+	}) as T;
 }
 
 // ── Parallel Execution with Concurrency Limit ─────────────────────────
@@ -588,6 +597,8 @@ function renderAgentProgress(
 	if (r.usage.turns) usageParts.push(`${r.usage.turns} turn${r.usage.turns > 1 ? "s" : ""}`);
 	if (r.usage.input) usageParts.push(`in:${formatTokens(r.usage.input)}`);
 	if (r.usage.output) usageParts.push(`out:${formatTokens(r.usage.output)}`);
+	if (r.usage.cacheRead) usageParts.push(`cR:${formatTokens(r.usage.cacheRead)}`);
+	if (r.usage.cacheWrite) usageParts.push(`cW:${formatTokens(r.usage.cacheWrite)}`);
 	if (r.usage.cost) usageParts.push(`$${r.usage.cost.toFixed(4)}`);
 	if (usageParts.length) {
 		c.addChild(new Text(theme.fg("dim", usageParts.join(" · ")), 0, 0));
@@ -626,18 +637,20 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(
-				Type.String({ description: "Agent: 'scout', 'researcher', or 'worker' (SINGLE mode)" }),
+				Type.String({ description: "Name of the agent to invoke (SINGLE mode)" }),
 			),
 			task: Type.Optional(Type.String({ description: "Task description (SINGLE mode)" })),
 			tasks: Type.Optional(
 				Type.Array(
 					Type.Object({
-						agent: Type.String({ description: "Agent: 'scout', 'researcher', or 'worker'" }),
+						agent: Type.String({ description: "Name of the agent to invoke" }),
 						task: Type.String({ description: "Task description" }),
+						cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 					}),
 					{ description: "PARALLEL mode: array of {agent, task} objects" },
 				),
 			),
+			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 		}),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -649,9 +662,10 @@ export default function (pi: ExtensionAPI) {
 				const taskList = params.tasks;
 
 				// Validate all agents
+				const available = agents.map((a) => a.name).join(", ") || "none";
 				for (const t of taskList) {
-					if (!VALID_AGENTS.includes(t.agent)) {
-						throw new Error(`Unknown agent: ${t.agent}. Valid agents: ${VALID_AGENTS.join(", ")}`);
+					if (!agents.find((a) => a.name === t.agent)) {
+						throw new Error(`Unknown agent: ${t.agent}. Available agents: ${available}`);
 					}
 				}
 
@@ -665,12 +679,12 @@ export default function (pi: ExtensionAPI) {
 						output: "",
 						exitCode: -1,
 						model: undefined,
-						usage: { input: 0, output: 0, cost: 0, turns: 0 },
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 						progress: { agent: taskList[i].agent, status: "pending" as any, task: taskList[i].task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 					};
 				}
 
-				const fireParallelUpdate = () => {
+				const flushParallelUpdate = () => {
 					onUpdate?.({
 						content: [{ type: "text", text: `Running ${taskList.length} tasks...` }],
 						details: {
@@ -679,17 +693,18 @@ export default function (pi: ExtensionAPI) {
 						},
 					});
 				};
+				const fireParallelUpdate = throttle(flushParallelUpdate, 150);
 
 				const results = await mapConcurrent(taskList, maxConcurrency, async (t, idx) => {
 					const agent = agents.find((a) => a.name === t.agent)!;
-					const result = await runSubagent(agent, t.task, cwd, signal, (progress) => {
+					const result = await runSubagent(agent, t.task, t.cwd ?? cwd, signal, (progress) => {
 						allResults[idx].progress = progress;
 						fireParallelUpdate();
 					});
 
 					// Update allResults with the completed result so the UI reflects it immediately
 					allResults[idx] = result;
-					fireParallelUpdate();
+					flushParallelUpdate();
 
 					return result;
 				});
@@ -706,21 +721,22 @@ export default function (pi: ExtensionAPI) {
 				};
 			} else if (params.agent && params.task) {
 				// ── Single mode ──
-				if (!VALID_AGENTS.includes(params.agent)) {
-					throw new Error(`Unknown agent: ${params.agent}. Valid agents: ${VALID_AGENTS.join(", ")}`);
+				const agent = agents.find((a) => a.name === params.agent);
+				if (!agent) {
+					const available = agents.map((a) => a.name).join(", ") || "none";
+					throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
 				}
 
-				const agent = agents.find((a) => a.name === params.agent)!;
 				const liveResult: AgentResult = {
 					agent: params.agent!,
 					task: params.task!,
 					output: "",
 					exitCode: -1,
 					model: agent.model,
-					usage: { input: 0, output: 0, cost: 0, turns: 0 },
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 					progress: { agent: params.agent!, status: "running" as const, task: params.task!, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 				};
-				const result = await runSubagent(agent, params.task, cwd, signal, (progress) => {
+				const result = await runSubagent(agent, params.task, params.cwd ?? cwd, signal, (progress) => {
 					liveResult.progress = progress;
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
@@ -728,9 +744,11 @@ export default function (pi: ExtensionAPI) {
 					});
 				});
 
+				const isError = result.exitCode !== 0 || !!result.progress.error;
 				return {
 					content: [{ type: "text", text: result.output || "(no output)" }],
 					details: { mode: "single" as const, results: [result] },
+					...(isError ? { isError: true } : {}),
 				};
 			} else {
 				throw new Error("Provide either (agent + task) for single mode, or tasks[] for parallel mode.");
@@ -738,26 +756,24 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		// ── Render: tool call header ──
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-
+		renderCall(args, theme, _context) {
 			if (args.tasks && args.tasks.length > 0) {
 				const agentNames = args.tasks.map((t: any) => t.agent).join(", ");
-				text.setText(
+				return new Text(
 					`${theme.fg("toolTitle", theme.bold("subagent"))} ${theme.fg("accent", "parallel")} ${theme.fg("dim", `(${args.tasks.length} tasks: ${agentNames})`)}`,
+					0, 0,
 				);
-			} else if (args.agent) {
+			}
+			if (args.agent) {
 				const taskPreview = args.task
 					? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task).replace(/\n/g, " ")
 					: "";
-				text.setText(
+				return new Text(
 					`${theme.fg("toolTitle", theme.bold("subagent"))} ${theme.fg("accent", args.agent)} ${theme.fg("dim", taskPreview)}`,
+					0, 0,
 				);
-			} else {
-				text.setText(theme.fg("toolTitle", theme.bold("subagent")));
 			}
-
-			return text;
+			return new Text(theme.fg("toolTitle", theme.bold("subagent")), 0, 0);
 		},
 
 		// ── Render: result ──

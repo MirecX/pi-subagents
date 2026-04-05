@@ -44,6 +44,5 @@ subagents/
 ├── index.ts           # Extension entry point
 ├── agents/            # Agent configs (frontmatter + system prompt)
 └── tools/             # Extensions loaded into subagent processes
-    ├── web-tools.ts   # web_search & web_fetch (wraps skill scripts)
     └── safe-bash.ts   # bash with dangerous command blocking
 ```

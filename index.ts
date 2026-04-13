@@ -15,7 +15,7 @@ import { Type } from "@sinclair/typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-interface AgentConfig {
+export interface AgentConfig {
 	name: string;
 	description: string;
 	tools: string[];
@@ -88,9 +88,29 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 	web_search: path.join(EXT_BASE, "web-search", "index.ts"),
 	web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
 	safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
+	video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
+	youtube_search: path.join(EXT_BASE, "youtube-search", "index.ts"),
+	google_image_search: path.join(EXT_BASE, "google-image-search", "index.ts"),
 };
 
-// ── Agent Discovery ───────────────────────────────────────────────────
+// ── Agent Discovery & Registration ────────────────────────────────────
+
+let agents: AgentConfig[] = [];
+
+export function registerAgent(config: AgentConfig): void {
+	if (agents.find((a) => a.name === config.name)) {
+		throw new Error(`Agent already registered: ${config.name}`);
+	}
+	agents.push(config);
+}
+
+export function unregisterAgent(name: string): void {
+	agents = agents.filter((a) => a.name !== name);
+}
+
+// Expose registration functions globally so other extensions loaded via jiti
+// (which creates separate module instances) can access the shared agents array.
+(globalThis as any).__pi_subagents = { registerAgent, unregisterAgent };
 
 function loadAgents(): AgentConfig[] {
 	const agents: AgentConfig[] = [];
@@ -622,17 +642,18 @@ function renderAgentProgress(
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	const maxConcurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
-	const agents = loadAgents();
+	agents = loadAgents();
 
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Run a subagent to complete a task. Available agents: scout (codebase recon with read/grep/find/ls), researcher (web research with web_search/web_fetch), worker (code changes with read/write/edit/safe_bash). Subagents have NO context from the current conversation — include all necessary context in the task description.",
-		promptSnippet: "Run scout/researcher/worker subagents for delegated tasks",
+			"Run a subagent to complete a task. Subagents have NO context from the current conversation — include all necessary context in the task description.",
+		promptSnippet: "Run subagents for delegated tasks",
 		promptGuidelines: [
-			"Use subagent for tasks that can be delegated: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
-			"For multiple independent tasks, use parallel mode with tasks[] array",
+			"Parallel tool calls are your primary parallelism mechanism — put multiple independent read/fetch/search calls in one function_calls block. Don't use subagents to parallelize simple I/O.",
+			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
+			"For multiple independent subagent tasks, use parallel mode with tasks[] array",
 			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
 		],
 		parameters: Type.Object({

@@ -6,7 +6,7 @@ A pi extension that registers a single `subagent` tool with three agents:
 |-------|-------|-------|---------|
 | **scout** | read, grep, find, ls | claude-haiku-4-5 | Fast codebase recon |
 | **researcher** | web_search, web_fetch | claude-sonnet-4-6 | Web research |
-| **worker** | read, write, edit, safe_bash | claude-sonnet-4-6 | Code changes |
+| **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
 
 ## Usage
 
@@ -59,8 +59,10 @@ You are an agent that does a specific thing...
 Frontmatter fields:
 - **name** (required) — unique agent name, used in `{ agent: "my-agent" }` calls
 - **description** — short description
-- **tools** — comma-separated list of tools the agent needs (builtin or extension)
+- **tools** — comma-separated list of tools the agent needs (builtin or extension). Include `subagent` here to let this agent spawn other agents.
 - **model** — model identifier (defaults to `anthropic/claude-sonnet-4-6`)
+- **thinking** — reasoning level: `off`, `low`, `medium`, `high` (defaults to `medium`)
+- **subagent_agents** — if `subagent` is in `tools`, restrict which agents this one may spawn. Comma-separated list of agent names. Omit for no restriction. Enforced by passing `PI_SUBAGENT_ALLOWED` env to the child `pi` process — the child's subagents extension filters its registry before any tool description sees it, so the child LLM literally can't reference an agent outside the allowlist.
 
 The markdown body becomes the agent's system prompt.
 
@@ -132,6 +134,8 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 ```
 
 Built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) work automatically. Any other tool the agent lists in its frontmatter must have a corresponding entry here pointing to the extension's `index.ts`.
+
+The `subagent` tool itself is listed in `CUSTOM_TOOL_EXTENSIONS` pointing back to this extension's own `index.ts` — that's how an agent like `worker` can recursively spawn other agents. Recursion is bounded only by each agent's `subagent_agents` allowlist (e.g. worker can spawn scout/researcher, neither of which declares the `subagent` tool, so the chain stops at depth 2).
 
 ## Structure
 

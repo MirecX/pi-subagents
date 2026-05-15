@@ -23,19 +23,46 @@ export interface AgentConfig {
 	thinking: string;
 	systemPrompt: string;
 	filePath: string;
+	/**
+	 * If this agent has the `subagent` tool, restrict which agents it may spawn.
+	 * Passed to the child pi process via `PI_SUBAGENT_ALLOWED` so the child's
+	 * subagents extension filters its own registry before exposing it to the LLM.
+	 * `undefined` means no restriction (child sees every registered agent).
+	 */
+	subagentAgents?: string[];
 }
 
 interface ToolEvent {
 	tool: string;
 	args: string;
+	/** Matches the producing tool_execution_start/update/end event. */
+	toolCallId?: string;
+	/**
+	 * "running" while between tool_execution_start and tool_execution_end; flipped
+	 * to "done" on end. We store every in-flight call in recentTools (keyed by
+	 * toolCallId) rather than a single current-tool slot, because pi-agent-core
+	 * dispatches a turn's tool calls in parallel via Promise.all — a single slot
+	 * would let the second start overwrite the first.
+	 */
+	status: "running" | "done";
+	/**
+	 * Live progress of subagents spawned by this tool call. Populated only for
+	 * `subagent` tool calls, from the `partialResult.details.results` payload of
+	 * `tool_execution_update` events (and refreshed once more from the end
+	 * event's final results). Recursive: each child's own progress may carry
+	 * further children via its `recentTools[i].children`.
+	 */
+	children?: AgentResult[];
 }
 
 interface AgentProgress {
 	agent: string;
 	status: "pending" | "running" | "completed" | "failed";
 	task: string;
-	currentTool?: string;
-	currentToolArgs?: string;
+	/**
+	 * Chronological log of tool calls — running and done interleaved. The
+	 * renderer prefixes running entries with `▸` and done ones with `  `.
+	 */
 	recentTools: ToolEvent[];
 	toolCount: number;
 	tokens: number;
@@ -93,13 +120,29 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 	video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
 	youtube_search: path.join(EXT_BASE, "youtube-search", "index.ts"),
 	google_image_search: path.join(EXT_BASE, "google-image-search", "index.ts"),
+	// `subagent` is the tool this very extension registers. Listing it here lets
+	// a parent agent grant it to a child agent — the child pi process loads this
+	// same index.ts via `--extension`, sees its own subagent tool, and (if
+	// PI_SUBAGENT_ALLOWED is set) only registers the allowlisted agents.
+	subagent: path.join(EXT_DIR, "index.ts"),
 };
 
 // ── Agent Discovery & Registration ────────────────────────────────────
 
 let agents: AgentConfig[] = [];
 
+// Read once at module load. If we're a child subagent process whose parent
+// pinned an allowlist, we silently ignore any agent (built-in OR registered
+// later by a third-party extension) that isn't in the list.
+const SUBAGENT_ALLOWLIST: string[] | undefined = (() => {
+	const raw = process.env.PI_SUBAGENT_ALLOWED;
+	if (!raw) return undefined;
+	const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+	return list.length > 0 ? list : undefined;
+})();
+
 export function registerAgent(config: AgentConfig): void {
+	if (SUBAGENT_ALLOWLIST && !SUBAGENT_ALLOWLIST.includes(config.name)) return;
 	if (agents.find((a) => a.name === config.name)) {
 		throw new Error(`Agent already registered: ${config.name}`);
 	}
@@ -127,6 +170,10 @@ function loadAgents(): AgentConfig[] {
 			.split(",")
 			.map((t) => t.trim())
 			.filter(Boolean);
+		const rawSubagentAgents = (frontmatter as Record<string, string>).subagent_agents;
+		const subagentAgents = rawSubagentAgents
+			? rawSubagentAgents.split(",").map((t) => t.trim()).filter(Boolean)
+			: undefined;
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description || "",
@@ -135,6 +182,7 @@ function loadAgents(): AgentConfig[] {
 			thinking: frontmatter.thinking || "medium",
 			systemPrompt: body,
 			filePath,
+			subagentAgents,
 		});
 	}
 	return agents;
@@ -204,6 +252,12 @@ function formatToolPreview(name: string, args: Record<string, unknown>): string 
 }
 
 function truncLine(text: string, maxWidth: number): string {
+	// Collapse embedded newlines first so we render exactly one visible line.
+	// We can't strip them inside `text` directly (would also touch ANSI escapes
+	// like "\x1b[0m"), so we only target literal \r and \n outside of escapes.
+	if (text.includes("\n") || text.includes("\r")) {
+		text = text.replace(/\r?\n/g, "↵ ");
+	}
 	if (visibleWidth(text) <= maxWidth) return text;
 	// Simple truncation - strip to fit
 	let result = "";
@@ -234,7 +288,7 @@ async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
-): Promise<{ args: string[]; tempDir: string }> {
+): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv | undefined }> {
 	const piBin = resolvePiBinary();
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
@@ -291,7 +345,17 @@ async function buildPiArgs(
 		args.push(`Task: ${task}`);
 	}
 
-	return { args: [piBin.command, ...args], tempDir };
+	// If this agent is allowed to spawn subagents AND we want to restrict which
+	// ones, pass the allowlist down via env. The child pi process loads this
+	// extension and filters its agent registry before exposing tool descriptions
+	// to the LLM — so the child literally cannot request an agent outside the
+	// allowlist (the name isn't in its prompt).
+	let childEnv: NodeJS.ProcessEnv | undefined;
+	if (agent.tools.includes("subagent") && agent.subagentAgents && agent.subagentAgents.length > 0) {
+		childEnv = { ...process.env, PI_SUBAGENT_ALLOWED: agent.subagentAgents.join(",") };
+	}
+
+	return { args: [piBin.command, ...args], tempDir, childEnv };
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -306,14 +370,53 @@ function extractTextFromContent(content: unknown): string {
 	return "";
 }
 
+/** Collapse any whitespace run (incl. newlines) into a single space. Used to
+ *  keep tool-arg previews to one renderable line in collapsed view. */
+function flatten(s: string): string {
+	return s.replace(/\s+/g, " ").trim();
+}
+
+// Per-event hard cap on stored arg previews. Even in expanded view we don't
+// want a 50KB bash heredoc sitting in memory per tool call across last-20
+// `recentTools` slots per agent across N agents. A few KB covers any realistic
+// command; anything longer is almost certainly a generated payload the user
+// doesn't need to read inline anyway.
+const MAX_ARG_PREVIEW = 4000;
+
 function extractToolArgsPreview(args: Record<string, unknown>): string {
-	if (args.command) return String(args.command).slice(0, 100);
-	if (args.path) return String(args.path);
-	if (args.query) return `"${String(args.query).slice(0, 80)}"`;
-	if (args.url) return String(args.url);
-	if (args.pattern) return String(args.pattern);
-	const s = JSON.stringify(args);
-	return s.length > 80 ? s.slice(0, 80) + "…" : s;
+	const cap = (s: string) => (s.length > MAX_ARG_PREVIEW ? s.slice(0, MAX_ARG_PREVIEW) + "…" : s);
+	if (args.command) return cap(flatten(String(args.command)));
+	if (args.path) return cap(flatten(String(args.path)));
+	if (args.query) return `"${cap(flatten(String(args.query)))}"`;
+	if (args.url) return cap(flatten(String(args.url)));
+	if (args.pattern) return cap(flatten(String(args.pattern)));
+	// `subagent` tool args: show which agent(s) it's calling, not the full task body.
+	if (args.agent) return flatten(String(args.agent));
+	if (Array.isArray(args.tasks)) {
+		const names = (args.tasks as Array<{ agent?: string }>)
+			.map((t) => t?.agent || "?")
+			.join(", ");
+		return `parallel(${names})`;
+	}
+	return cap(flatten(JSON.stringify(args)));
+}
+
+/**
+ * Cap the recent-tools log at 20 entries while preserving in-flight calls.
+ * Walks from the oldest end dropping `done` entries until the array fits; never
+ * drops a `running` entry, because doing so would orphan its eventual
+ * tool_execution_end and silently lose the row from the display.
+ */
+const RECENT_TOOLS_CAP = 20;
+function capRecentTools(tools: ToolEvent[]): void {
+	let i = 0;
+	while (tools.length > RECENT_TOOLS_CAP && i < tools.length) {
+		if (tools[i].status === "done") {
+			tools.splice(i, 1);
+		} else {
+			i++;
+		}
+	}
 }
 
 async function runSubagent(
@@ -323,7 +426,7 @@ async function runSubagent(
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
 ): Promise<AgentResult> {
-	const { args, tempDir } = await buildPiArgs(agent, task, cwd);
+	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -358,6 +461,7 @@ async function runSubagent(
 		const proc = spawn(command, spawnArgs, {
 			cwd,
 			stdio: ["ignore", "pipe", "pipe"],
+			...(childEnv ? { env: childEnv } : {}),
 		});
 
 		let buf = "";
@@ -371,24 +475,48 @@ async function runSubagent(
 
 				if (evt.type === "tool_execution_start") {
 					progress.toolCount++;
-					progress.currentTool = evt.toolName;
-					progress.currentToolArgs = extractToolArgsPreview((evt.args || {}) as Record<string, unknown>);
+					progress.recentTools.push({
+						tool: evt.toolName,
+						args: extractToolArgsPreview((evt.args || {}) as Record<string, unknown>),
+						toolCallId: evt.toolCallId,
+						status: "running",
+					});
+					capRecentTools(progress.recentTools);
 					fireUpdate();
 				}
 
-				if (evt.type === "tool_execution_end") {
-					if (progress.currentTool) {
-						progress.recentTools.push({
-							tool: progress.currentTool,
-							args: progress.currentToolArgs || "",
-						});
-						// Keep last 20
-						if (progress.recentTools.length > 20) {
-							progress.recentTools.splice(0, progress.recentTools.length - 20);
+				// Subagents emit `tool_execution_update` while their own subagent tool
+				// runs — the partial result carries the live nested AgentResult[]. We
+				// surface that as `children` on the in-flight ToolEvent so the renderer
+				// can inline grandchild activity beneath the parent's tool row.
+				if (evt.type === "tool_execution_update") {
+					const partial = evt.partialResult as { details?: { results?: unknown } } | undefined;
+					const nested = partial?.details?.results;
+					if (evt.toolName === "subagent" && Array.isArray(nested) && evt.toolCallId) {
+						const hit = progress.recentTools.find((t) => t.toolCallId === evt.toolCallId);
+						if (hit) {
+							hit.children = nested as AgentResult[];
+							fireUpdate();
 						}
 					}
-					progress.currentTool = undefined;
-					progress.currentToolArgs = undefined;
+				}
+
+				if (evt.type === "tool_execution_end") {
+					const hit = evt.toolCallId
+						? progress.recentTools.find((t) => t.toolCallId === evt.toolCallId)
+						: undefined;
+					if (hit) {
+						hit.status = "done";
+						// Prefer the end event's final results over the last throttled
+						// update — throttling can drop the trailing update, leaving stale
+						// children visible on a tool that has actually completed.
+						const finalResult = evt.result as { details?: { results?: unknown } } | undefined;
+						const finalChildren = finalResult?.details?.results;
+						if (evt.toolName === "subagent" && Array.isArray(finalChildren)) {
+							hit.children = finalChildren as AgentResult[];
+						}
+					}
+					capRecentTools(progress.recentTools);
 					fireUpdate();
 				}
 
@@ -550,13 +678,35 @@ function renderAgentProgress(
 	theme: Theme,
 	expanded: boolean,
 	w: number,
+	depth: number = 0,
 ): Container {
 	const c = new Container();
 	const prog = r.progress;
 	const isRunning = prog.status === "running";
 	const isPending = prog.status === "pending";
+	const nested = depth > 0;
 
-	// Header: icon + agent + stats (always one line, truncated)
+	// Indent prefix for nested levels. ANSI escapes are zero-width so this works
+	// with colored content. Children are visually offset by 2 spaces per depth.
+	const indent = nested ? "  ".repeat(depth) : "";
+	// Available width shrinks with indent so truncLine still fits one line.
+	const innerW = Math.max(20, w - indent.length);
+
+	// `line(content)`: emit one indented, optionally-truncated row.
+	// In expanded mode we still indent but don't truncate — the Text component
+	// wraps and we want every wrapped line to share the same left margin, so we
+	// keep the indent as a hard prefix on the first line only (pi-tui Text
+	// doesn't expose a per-line gutter). Wrapping at depth is rare anyway since
+	// the lines that wrap (lastMessage, full output) only render at depth 0.
+	const addLine = (content: string) => {
+		if (expanded) {
+			c.addChild(new Text(indent + content, 0, 0));
+		} else {
+			c.addChild(new Text(indent + truncLine(content, innerW), 0, 0));
+		}
+	};
+
+	// Header: icon + agent + stats (always one line)
 	const icon = isRunning
 		? theme.fg("warning", "⟳")
 		: isPending
@@ -566,50 +716,49 @@ function renderAgentProgress(
 				: theme.fg("error", "✗");
 	const stats = `${prog.toolCount} tools · ${formatDuration(prog.durationMs)}`;
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
-	c.addChild(
-		new Text(
-			truncLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`, w),
-			0, 0,
-		),
-	);
+	addLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`);
 
-	// Task
-	if (expanded) {
-		// Full task, Text wraps naturally
-		c.addChild(new Text(theme.fg("dim", `Task: ${r.task}`), 0, 0));
-	} else {
-		// Truncate to one line
-		const flat = r.task.replace(/\n/g, " ");
-		c.addChild(
-			new Text(truncLine(theme.fg("dim", `Task: ${flat}`), w), 0, 0),
-		);
-	}
-
-	// Current tool (running state)
-	if (isRunning && prog.currentTool) {
-		const toolLine = prog.currentToolArgs
-			? `${prog.currentTool}: ${prog.currentToolArgs}`
-			: prog.currentTool;
+	// Task — only at depth 0. Nested levels are about activity, not restating
+	// the brief (the parent's recentTools row above already shows the dispatch).
+	if (!nested) {
 		if (expanded) {
-			c.addChild(new Text(theme.fg("warning", `▸ ${toolLine}`), 0, 0));
+			c.addChild(new Text(theme.fg("dim", `Task: ${r.task}`), 0, 0));
 		} else {
-			c.addChild(new Text(truncLine(theme.fg("warning", `▸ ${toolLine}`), w), 0, 0));
+			const flat = r.task.replace(/\n/g, " ");
+			c.addChild(new Text(truncLine(theme.fg("dim", `Task: ${flat}`), w), 0, 0));
 		}
 	}
 
-	// Recent tools (always all)
-	const toolsToShow = prog.recentTools;
-	for (const t of toolsToShow) {
-		const line = `  ${t.tool}: ${t.args}`;
-		if (expanded) {
-			c.addChild(new Text(theme.fg("muted", line), 0, 0));
+	// Helper for rendering one tool row + recursively rendering its children.
+	const renderToolRow = (
+		toolName: string,
+		args: string,
+		children: AgentResult[] | undefined,
+		isCurrent: boolean,
+	) => {
+		const body = args ? `${toolName}: ${args}` : toolName;
+		if (isCurrent) {
+			addLine(theme.fg("warning", `▸ ${body}`));
 		} else {
-			c.addChild(new Text(truncLine(theme.fg("muted", line), w), 0, 0));
+			addLine(theme.fg("muted", `  ${body}`));
 		}
+		if (children && children.length > 0) {
+			for (const child of children) {
+				c.addChild(renderAgentProgress(child, theme, expanded, w, depth + 1));
+			}
+		}
+	};
+
+	// Tool log — running and done interleaved in chronological order. Running
+	// entries get the `▸` marker; done ones get a muted `  ` prefix. Children
+	// (live subagent activity) render inline beneath each row.
+	for (const t of prog.recentTools) {
+		renderToolRow(t.tool, t.args, t.children, t.status === "running");
 	}
 
-	// Latest assistant message — the prose "thinking" text, always visible
-	if (prog.lastMessage) {
+	// Latest assistant message (prose "thinking") — only at depth 0.
+	// Per spec: deeper levels show tool calls only, no thinking/last-message.
+	if (!nested && prog.lastMessage) {
 		c.addChild(new Spacer(1));
 		if (expanded) {
 			c.addChild(new Text(theme.fg("text", prog.lastMessage), 0, 0));
@@ -618,40 +767,37 @@ function renderAgentProgress(
 		}
 	}
 
-	// Expanded: full final output
-	if (!isRunning && r.output && expanded) {
+	// Expanded final output — only at depth 0. Nested levels are summarized via
+	// their own tool list; the master-level result block is enough context.
+	if (!nested && !isRunning && r.output && expanded) {
 		c.addChild(new Spacer(1));
 		const mdTheme = getMarkdownTheme();
 		c.addChild(new Markdown(r.output, 0, 0, mdTheme));
 	}
 
-	// Usage breakdown — matches pi footer format: ↑in ↓out Rcache_read Wcache_write $cost %/max
-	c.addChild(new Spacer(1));
+	// Usage line. At depth 0 we include the context %/max gauge; deeper levels
+	// drop it (a child's context % isn't actionable from the parent's row, and
+	// the line gets noisy at indent).
+	if (!nested) c.addChild(new Spacer(1));
 	const usageParts: string[] = [];
 	if (r.usage.input) usageParts.push(theme.fg("dim", `↑${formatTokens(r.usage.input)}`));
 	if (r.usage.output) usageParts.push(theme.fg("dim", `↓${formatTokens(r.usage.output)}`));
 	if (r.usage.cacheRead) usageParts.push(theme.fg("dim", `R${formatTokens(r.usage.cacheRead)}`));
 	if (r.usage.cacheWrite) usageParts.push(theme.fg("dim", `W${formatTokens(r.usage.cacheWrite)}`));
 	if (r.usage.cost) usageParts.push(theme.fg("dim", `$${r.usage.cost.toFixed(3)}`));
-	if (prog.tokens > 0) {
+	if (!nested && prog.tokens > 0) {
 		const ctxStr = formatContextUsage(prog.tokens, r.contextWindow);
 		const pct = r.contextWindow ? (prog.tokens / r.contextWindow) * 100 : 0;
 		const coloredCtx = pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
 		usageParts.push(coloredCtx);
 	}
 	if (usageParts.length) {
-		const usageLine = usageParts.join(" ");
-		c.addChild(new Text(expanded ? usageLine : truncLine(usageLine, w), 0, 0));
+		addLine(usageParts.join(" "));
 	}
-	
 
 	// Error
 	if (prog.error) {
-		if (expanded) {
-			c.addChild(new Text(theme.fg("error", `Error: ${prog.error}`), 0, 0));
-		} else {
-			c.addChild(new Text(truncLine(theme.fg("error", `Error: ${prog.error}`), w), 0, 0));
-		}
+		addLine(theme.fg("error", `Error: ${prog.error}`));
 	}
 
 	return c;
@@ -663,6 +809,14 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	const maxConcurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
 	agents = loadAgents();
+
+	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
+	// pins which agents we're allowed to expose. Filter the registry now, before
+	// any tool description sees the agent list — the child LLM should not even
+	// know that other agents exist.
+	if (SUBAGENT_ALLOWLIST) {
+		agents = agents.filter((a) => SUBAGENT_ALLOWLIST.includes(a.name));
+	}
 
 	pi.registerTool({
 		name: "subagent",

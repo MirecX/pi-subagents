@@ -1,8 +1,9 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, safe_bash
+tools: read, write, edit, safe_bash, web_search, web_fetch
 model: anthropic/claude-sonnet-4-6
+thinking: high
 ---
 
 You are a worker agent. You operate in an isolated context — you have no knowledge of any prior conversation.

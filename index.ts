@@ -20,6 +20,7 @@ export interface AgentConfig {
 	description: string;
 	tools: string[];
 	model: string;
+	thinking: string;
 	systemPrompt: string;
 	filePath: string;
 }
@@ -50,6 +51,7 @@ interface AgentResult {
 	exitCode: number;
 	progress: AgentProgress;
 	model?: string;
+	contextWindow?: number;
 	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
 }
 
@@ -130,6 +132,7 @@ function loadAgents(): AgentConfig[] {
 			description: frontmatter.description || "",
 			tools,
 			model: frontmatter.model || "anthropic/claude-sonnet-4-6",
+			thinking: frontmatter.thinking || "medium",
 			systemPrompt: body,
 			filePath,
 		});
@@ -163,6 +166,13 @@ function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
 	return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`;
+}
+
+function formatContextUsage(tokens: number, contextWindow: number | undefined): string {
+	if (!contextWindow) return `${formatTokens(tokens)} ctx`;
+	const pct = (tokens / contextWindow) * 100;
+	const maxStr = contextWindow >= 1_000_000 ? `${(contextWindow / 1_000_000).toFixed(1)}M` : `${Math.round(contextWindow / 1000)}k`;
+	return `${pct.toFixed(1)}%/${maxStr}`;
 }
 
 function formatToolPreview(name: string, args: Record<string, unknown>): string {
@@ -236,14 +246,16 @@ async function buildPiArgs(
 
 	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
 
-	// Separate builtin tools from custom tools
-	const builtinTools: string[] = [];
+	// Separate builtin tools from custom tools. Both kinds share the same
+	// --tools allowlist in pi; --no-tools would disable extension tools too.
+	const allowlist: string[] = [];
 	const extensionPaths = new Set<string>();
 
 	for (const tool of agent.tools) {
 		if (BUILTIN_TOOLS.has(tool)) {
-			builtinTools.push(tool);
+			allowlist.push(tool);
 		} else if (CUSTOM_TOOL_EXTENSIONS[tool]) {
+			allowlist.push(tool);
 			extensionPaths.add(CUSTOM_TOOL_EXTENSIONS[tool]);
 		}
 	}
@@ -251,10 +263,11 @@ async function buildPiArgs(
 	// Use --no-extensions then add only what we need
 	args.push("--no-extensions");
 
-	if (builtinTools.length > 0) {
-		args.push("--tools", builtinTools.join(","));
+	if (allowlist.length > 0) {
+		// --tools is a unified allowlist that applies to built-in, extension, and custom tools.
+		args.push("--tools", allowlist.join(","));
 	} else {
-		// No builtin tools needed — disable defaults so only extension tools are available
+		// Agent declared no tools — disable everything.
 		args.push("--no-tools");
 	}
 
@@ -263,6 +276,7 @@ async function buildPiArgs(
 	}
 
 	args.push("--models", agent.model);
+	args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", promptPath);
 
 	// Handle long tasks by writing to file
@@ -307,7 +321,7 @@ async function runSubagent(
 	task: string,
 	cwd: string,
 	signal: AbortSignal | undefined,
-	onUpdate?: (progress: AgentProgress) => void,
+	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
 ): Promise<AgentResult> {
 	const { args, tempDir } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
@@ -337,7 +351,7 @@ async function runSubagent(
 
 	const fireUpdate = throttle(() => {
 		progress.durationMs = Date.now() - startTime;
-		onUpdate?.(progress);
+		onUpdate?.(progress, result.usage);
 	}, 150);
 
 	const exitCode = await new Promise<number>((resolve) => {
@@ -392,7 +406,7 @@ async function runSubagent(
 							result.usage.cacheRead += u.cacheRead || 0;
 							result.usage.cacheWrite += u.cacheWrite || 0;
 							result.usage.cost += u.cost?.total || 0;
-							progress.tokens = result.usage.input + result.usage.output;
+							progress.tokens = result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite;
 						}
 						if (evt.message.model) result.model = evt.message.model;
 						if (evt.message.errorMessage) progress.error = evt.message.errorMessage;
@@ -550,7 +564,7 @@ function renderAgentProgress(
 			: r.exitCode === 0
 				? theme.fg("success", "✓")
 				: theme.fg("error", "✗");
-	const stats = `${prog.toolCount} tools · ${formatTokens(prog.tokens)} tok · ${formatDuration(prog.durationMs)}`;
+	const stats = `${prog.toolCount} tools · ${formatDuration(prog.durationMs)}`;
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
 	c.addChild(
 		new Text(
@@ -611,17 +625,23 @@ function renderAgentProgress(
 		c.addChild(new Markdown(r.output, 0, 0, mdTheme));
 	}
 
-	// Usage breakdown
+	// Usage breakdown — matches pi footer format: ↑in ↓out Rcache_read Wcache_write $cost %/max
 	c.addChild(new Spacer(1));
 	const usageParts: string[] = [];
-	if (r.usage.turns) usageParts.push(`${r.usage.turns} turn${r.usage.turns > 1 ? "s" : ""}`);
-	if (r.usage.input) usageParts.push(`in:${formatTokens(r.usage.input)}`);
-	if (r.usage.output) usageParts.push(`out:${formatTokens(r.usage.output)}`);
-	if (r.usage.cacheRead) usageParts.push(`cR:${formatTokens(r.usage.cacheRead)}`);
-	if (r.usage.cacheWrite) usageParts.push(`cW:${formatTokens(r.usage.cacheWrite)}`);
-	if (r.usage.cost) usageParts.push(`$${r.usage.cost.toFixed(4)}`);
+	if (r.usage.input) usageParts.push(theme.fg("dim", `↑${formatTokens(r.usage.input)}`));
+	if (r.usage.output) usageParts.push(theme.fg("dim", `↓${formatTokens(r.usage.output)}`));
+	if (r.usage.cacheRead) usageParts.push(theme.fg("dim", `R${formatTokens(r.usage.cacheRead)}`));
+	if (r.usage.cacheWrite) usageParts.push(theme.fg("dim", `W${formatTokens(r.usage.cacheWrite)}`));
+	if (r.usage.cost) usageParts.push(theme.fg("dim", `$${r.usage.cost.toFixed(3)}`));
+	if (prog.tokens > 0) {
+		const ctxStr = formatContextUsage(prog.tokens, r.contextWindow);
+		const pct = r.contextWindow ? (prog.tokens / r.contextWindow) * 100 : 0;
+		const coloredCtx = pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
+		usageParts.push(coloredCtx);
+	}
 	if (usageParts.length) {
-		c.addChild(new Text(theme.fg("dim", usageParts.join(" · ")), 0, 0));
+		const usageLine = usageParts.join(" ");
+		c.addChild(new Text(expanded ? usageLine : truncLine(usageLine, w), 0, 0));
 	}
 	
 
@@ -694,12 +714,16 @@ export default function (pi: ExtensionAPI) {
 
 				// Initialize all result slots as pending
 				for (let i = 0; i < taskList.length; i++) {
+					const agentCfg = agents.find((a) => a.name === taskList[i].agent)!;
+					const [initProvider, initModelId] = (agentCfg.model || "").split("/");
+					const initContextWindow = initProvider && initModelId ? ctx.modelRegistry.find(initProvider, initModelId)?.contextWindow : undefined;
 					allResults[i] = {
 						agent: taskList[i].agent,
 						task: taskList[i].task,
 						output: "",
 						exitCode: -1,
 						model: undefined,
+						contextWindow: initContextWindow,
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 						progress: { agent: taskList[i].agent, status: "pending" as any, task: taskList[i].task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 					};
@@ -718,13 +742,16 @@ export default function (pi: ExtensionAPI) {
 
 				const results = await mapConcurrent(taskList, maxConcurrency, async (t, idx) => {
 					const agent = agents.find((a) => a.name === t.agent)!;
-					const result = await runSubagent(agent, t.task, t.cwd ?? cwd, signal, (progress) => {
+					const result = await runSubagent(agent, t.task, t.cwd ?? cwd, signal, (progress, usage) => {
 						allResults[idx].progress = progress;
+						allResults[idx].usage = { ...usage };
 						fireParallelUpdate();
 					});
 
 					// Update allResults with the completed result so the UI reflects it immediately
+					const savedContextWindow = allResults[idx].contextWindow;
 					allResults[idx] = result;
+					allResults[idx].contextWindow = savedContextWindow;
 					flushParallelUpdate();
 
 					return result;
@@ -748,23 +775,28 @@ export default function (pi: ExtensionAPI) {
 					throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
 				}
 
+				const [singleProvider, singleModelId] = (agent.model || "").split("/");
+				const singleContextWindow = singleProvider && singleModelId ? ctx.modelRegistry.find(singleProvider, singleModelId)?.contextWindow : undefined;
 				const liveResult: AgentResult = {
 					agent: params.agent!,
 					task: params.task!,
 					output: "",
 					exitCode: -1,
 					model: agent.model,
+					contextWindow: singleContextWindow,
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 					progress: { agent: params.agent!, status: "running" as const, task: params.task!, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 				};
-				const result = await runSubagent(agent, params.task, params.cwd ?? cwd, signal, (progress) => {
+				const result = await runSubagent(agent, params.task, params.cwd ?? cwd, signal, (progress, usage) => {
 					liveResult.progress = progress;
+					liveResult.usage = { ...usage };
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
 						details: { mode: "single" as const, results: [liveResult] },
 					});
 				});
 
+				result.contextWindow = singleContextWindow;
 				const isError = result.exitCode !== 0 || !!result.progress.error;
 				return {
 					content: [{ type: "text", text: result.output || "(no output)" }],
@@ -825,7 +857,7 @@ export default function (pi: ExtensionAPI) {
 				c.addChild(
 					new Text(
 						truncLine(
-							`${totalIcon} ${theme.fg("toolTitle", theme.bold("parallel"))} ${ok}/${details.results.length} completed · ${formatTokens(totalTokens)} tok · ${formatDuration(totalDuration)}`,
+							`${totalIcon} ${theme.fg("toolTitle", theme.bold("parallel"))} ${ok}/${details.results.length} completed · ${formatTokens(totalTokens)} ctx · ${formatDuration(totalDuration)}`,
 							w,
 						),
 						0, 0,

@@ -53,7 +53,7 @@ Fetch directly when:
 
 ### Parallelism
 
-If you need two independent investigations (e.g. "map the auth code" AND "look up the library's session API"), dispatch them in parallel via `tasks: [...]`. Don't serialize independent work.
+If you need two independent investigations (e.g. "map the auth code" AND "look up the library's session API"), emit multiple `subagent` tool calls in the same turn — pi runs them in parallel automatically. Don't serialize independent work.
 
 ### What a subagent doesn't replace
 

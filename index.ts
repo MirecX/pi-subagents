@@ -83,7 +83,6 @@ interface AgentResult {
 }
 
 interface Details {
-	mode: "single" | "parallel";
 	results: AgentResult[];
 }
 
@@ -644,24 +643,30 @@ function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
 
 // ── Parallel Execution with Concurrency Limit ─────────────────────────
 
-async function mapConcurrent<T, R>(
-	items: T[],
-	concurrency: number,
-	fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-	const results: R[] = new Array(items.length);
-	let nextIndex = 0;
-
-	async function worker() {
-		while (nextIndex < items.length) {
-			const i = nextIndex++;
-			results[i] = await fn(items[i], i);
+/**
+ * Process-wide cap on simultaneous `runSubagent` calls. Each `execute()` of the
+ * `subagent` tool is independent (pi runs LLM tool calls via `Promise.all`), so
+ * we serialize at the `runSubagent` boundary. Per-process scope only — nested
+ * subagent processes have their own semaphore, so the cap applies to direct
+ * children, not the whole tree (which keeps things deadlock-free).
+ */
+class Semaphore {
+	private inFlight = 0;
+	private readonly waiters: Array<() => void> = [];
+	constructor(private readonly max: number) {}
+	async run<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.inFlight >= this.max) {
+			await new Promise<void>((r) => this.waiters.push(r));
+		}
+		this.inFlight++;
+		try {
+			return await fn();
+		} finally {
+			this.inFlight--;
+			const next = this.waiters.shift();
+			if (next) next();
 		}
 	}
-
-	const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
-	await Promise.all(workers);
-	return results;
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
@@ -807,7 +812,7 @@ function renderAgentProgress(
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
-	const maxConcurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+	const semaphore = new Semaphore(config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
 
 	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
@@ -827,150 +832,63 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Parallel tool calls are your primary parallelism mechanism — put multiple independent read/fetch/search calls in one function_calls block. Don't use subagents to parallelize simple I/O.",
 			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
-			"For multiple independent subagent tasks, use parallel mode with tasks[] array",
+			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
 			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
 		],
 		parameters: Type.Object({
-			agent: Type.Optional(
-				Type.String({ description: "Name of the agent to invoke (SINGLE mode)" }),
-			),
-			task: Type.Optional(Type.String({ description: "Task description (SINGLE mode)" })),
-			tasks: Type.Optional(
-				Type.Array(
-					Type.Object({
-						agent: Type.String({ description: "Name of the agent to invoke" }),
-						task: Type.String({ description: "Task description" }),
-						cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-					}),
-					{ description: "PARALLEL mode: array of {agent, task} objects" },
-				),
-			),
-			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+			agent: Type.String({ description: "Name of the agent to invoke" }),
+			task: Type.String({ description: "Task description" }),
+			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		}),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const cwd = ctx.cwd;
 
-			// Validate mode
-			if (params.tasks && params.tasks.length > 0) {
-				// ── Parallel mode ──
-				const taskList = params.tasks;
+			if (!params.agent || !params.task) {
+				throw new Error("`subagent` requires both `agent` and `task`. To fan out work, emit multiple `subagent` tool calls in the same turn — they run in parallel.");
+			}
 
-				// Validate all agents
+			const agent = agents.find((a) => a.name === params.agent);
+			if (!agent) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
-				for (const t of taskList) {
-					if (!agents.find((a) => a.name === t.agent)) {
-						throw new Error(`Unknown agent: ${t.agent}. Available agents: ${available}`);
-					}
-				}
+				throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
+			}
 
-				const allResults: AgentResult[] = [];
+			const [provider, modelId] = (agent.model || "").split("/");
+			const contextWindow = provider && modelId ? ctx.modelRegistry.find(provider, modelId)?.contextWindow : undefined;
+			const liveResult: AgentResult = {
+				agent: params.agent,
+				task: params.task,
+				output: "",
+				exitCode: -1,
+				model: agent.model,
+				contextWindow,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+				progress: { agent: params.agent, status: "running" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
+			};
 
-				// Initialize all result slots as pending
-				for (let i = 0; i < taskList.length; i++) {
-					const agentCfg = agents.find((a) => a.name === taskList[i].agent)!;
-					const [initProvider, initModelId] = (agentCfg.model || "").split("/");
-					const initContextWindow = initProvider && initModelId ? ctx.modelRegistry.find(initProvider, initModelId)?.contextWindow : undefined;
-					allResults[i] = {
-						agent: taskList[i].agent,
-						task: taskList[i].task,
-						output: "",
-						exitCode: -1,
-						model: undefined,
-						contextWindow: initContextWindow,
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-						progress: { agent: taskList[i].agent, status: "pending" as any, task: taskList[i].task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
-					};
-				}
-
-				const flushParallelUpdate = () => {
-					onUpdate?.({
-						content: [{ type: "text", text: `Running ${taskList.length} tasks...` }],
-						details: {
-							mode: "parallel" as const,
-							results: [...allResults],
-						},
-					});
-				};
-				const fireParallelUpdate = throttle(flushParallelUpdate, 150);
-
-				const results = await mapConcurrent(taskList, maxConcurrency, async (t, idx) => {
-					const agent = agents.find((a) => a.name === t.agent)!;
-					const result = await runSubagent(agent, t.task, t.cwd ?? cwd, signal, (progress, usage) => {
-						allResults[idx].progress = progress;
-						allResults[idx].usage = { ...usage };
-						fireParallelUpdate();
-					});
-
-					// Update allResults with the completed result so the UI reflects it immediately
-					const savedContextWindow = allResults[idx].contextWindow;
-					allResults[idx] = result;
-					allResults[idx].contextWindow = savedContextWindow;
-					flushParallelUpdate();
-
-					return result;
-				});
-
-				// Build final output text
-				const outputParts = results.map((r) => {
-					const header = `## ${r.agent}${r.exitCode !== 0 ? " (FAILED)" : ""}`;
-					return `${header}\n\n${r.output || "(no output)"}`;
-				});
-
-				return {
-					content: [{ type: "text", text: outputParts.join("\n\n---\n\n") }],
-					details: { mode: "parallel" as const, results },
-				};
-			} else if (params.agent && params.task) {
-				// ── Single mode ──
-				const agent = agents.find((a) => a.name === params.agent);
-				if (!agent) {
-					const available = agents.map((a) => a.name).join(", ") || "none";
-					throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
-				}
-
-				const [singleProvider, singleModelId] = (agent.model || "").split("/");
-				const singleContextWindow = singleProvider && singleModelId ? ctx.modelRegistry.find(singleProvider, singleModelId)?.contextWindow : undefined;
-				const liveResult: AgentResult = {
-					agent: params.agent!,
-					task: params.task!,
-					output: "",
-					exitCode: -1,
-					model: agent.model,
-					contextWindow: singleContextWindow,
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-					progress: { agent: params.agent!, status: "running" as const, task: params.task!, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
-				};
-				const result = await runSubagent(agent, params.task, params.cwd ?? cwd, signal, (progress, usage) => {
+			const result = await semaphore.run(() =>
+				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
-						details: { mode: "single" as const, results: [liveResult] },
+						details: { results: [liveResult] },
 					});
-				});
+				}),
+			);
 
-				result.contextWindow = singleContextWindow;
-				const isError = result.exitCode !== 0 || !!result.progress.error;
-				return {
-					content: [{ type: "text", text: result.output || "(no output)" }],
-					details: { mode: "single" as const, results: [result] },
-					...(isError ? { isError: true } : {}),
-				};
-			} else {
-				throw new Error("Provide either (agent + task) for single mode, or tasks[] for parallel mode.");
-			}
+			result.contextWindow = contextWindow;
+			const isError = result.exitCode !== 0 || !!result.progress.error;
+			return {
+				content: [{ type: "text", text: result.output || "(no output)" }],
+				details: { results: [result] },
+				...(isError ? { isError: true } : {}),
+			};
 		},
 
 		// ── Render: tool call header ──
 		renderCall(args, theme, _context) {
-			if (args.tasks && args.tasks.length > 0) {
-				const agentNames = args.tasks.map((t: any) => t.agent).join(", ");
-				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent"))} ${theme.fg("accent", "parallel")} ${theme.fg("dim", `(${args.tasks.length} tasks: ${agentNames})`)}`,
-					0, 0,
-				);
-			}
 			if (args.agent) {
 				const taskPreview = args.task
 					? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task).replace(/\n/g, " ")
@@ -995,41 +913,7 @@ export default function (pi: ExtensionAPI) {
 			const w = getTermWidth() - 4;
 			const expanded = options.expanded;
 			const c = new Container();
-
-			if (details.mode === "parallel") {
-				// Parallel summary header
-				const ok = details.results.filter((r) => r.exitCode === 0).length;
-				const running = details.results.filter((r) => r.progress?.status === "running").length;
-				const totalIcon = running > 0
-					? theme.fg("warning", "⟳")
-					: ok === details.results.length
-						? theme.fg("success", "✓")
-						: theme.fg("error", "✗");
-
-				const totalDuration = Math.max(...details.results.map((r) => r.progress?.durationMs || 0));
-				const totalTokens = details.results.reduce((s, r) => s + (r.progress?.tokens || 0), 0);
-				c.addChild(
-					new Text(
-						truncLine(
-							`${totalIcon} ${theme.fg("toolTitle", theme.bold("parallel"))} ${ok}/${details.results.length} completed · ${formatTokens(totalTokens)} ctx · ${formatDuration(totalDuration)}`,
-							w,
-						),
-						0, 0,
-					),
-				);
-				c.addChild(new Spacer(1));
-
-				for (let i = 0; i < details.results.length; i++) {
-					const r = details.results[i];
-					c.addChild(renderAgentProgress(r, theme, expanded, w));
-					if (i < details.results.length - 1) c.addChild(new Spacer(1));
-				}
-			} else {
-				// Single agent
-				const r = details.results[0];
-				c.addChild(renderAgentProgress(r, theme, expanded, w));
-			}
-
+			c.addChild(renderAgentProgress(details.results[0], theme, expanded, w));
 			return c;
 		},
 	});

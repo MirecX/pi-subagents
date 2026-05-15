@@ -10,20 +10,14 @@ A pi extension that registers a single `subagent` tool with three agents:
 
 ## Usage
 
-**Single mode:**
+One tool call = one subagent:
 ```json
 { "agent": "scout", "task": "Find all auth-related files in src/" }
 ```
 
-**Parallel mode:**
-```json
-{ "tasks": [
-  { "agent": "scout", "task": "Map the database layer" },
-  { "agent": "researcher", "task": "Best practices for connection pooling" }
-]}
-```
+To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
 
-Max 4 concurrent subagents (configurable). Each runs as an isolated `pi` process with no inherited context — all context must be in the task description.
+Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description.
 
 ## Config
 

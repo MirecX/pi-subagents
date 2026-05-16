@@ -400,24 +400,6 @@ function extractToolArgsPreview(args: Record<string, unknown>): string {
 	return cap(flatten(JSON.stringify(args)));
 }
 
-/**
- * Cap the recent-tools log at 20 entries while preserving in-flight calls.
- * Walks from the oldest end dropping `done` entries until the array fits; never
- * drops a `running` entry, because doing so would orphan its eventual
- * tool_execution_end and silently lose the row from the display.
- */
-const RECENT_TOOLS_CAP = 20;
-function capRecentTools(tools: ToolEvent[]): void {
-	let i = 0;
-	while (tools.length > RECENT_TOOLS_CAP && i < tools.length) {
-		if (tools[i].status === "done") {
-			tools.splice(i, 1);
-		} else {
-			i++;
-		}
-	}
-}
-
 async function runSubagent(
 	agent: AgentConfig,
 	task: string,
@@ -480,7 +462,6 @@ async function runSubagent(
 						toolCallId: evt.toolCallId,
 						status: "running",
 					});
-					capRecentTools(progress.recentTools);
 					fireUpdate();
 				}
 
@@ -515,7 +496,6 @@ async function runSubagent(
 							hit.children = finalChildren as AgentResult[];
 						}
 					}
-					capRecentTools(progress.recentTools);
 					fireUpdate();
 				}
 
@@ -533,7 +513,15 @@ async function runSubagent(
 							result.usage.cacheRead += u.cacheRead || 0;
 							result.usage.cacheWrite += u.cacheWrite || 0;
 							result.usage.cost += u.cost?.total || 0;
-							progress.tokens = result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite;
+							// Context-window gauge: snapshot of the LATEST assistant turn's usage,
+							// NOT a cumulative sum across turns. Each turn re-sends the whole
+							// conversation as input + cacheRead, so one assistant message already
+							// represents the current context size. Summing across N turns would
+							// inflate the displayed % by roughly Nx (the bug this replaced).
+							// Matches pi's `calculateContextTokens` in core/compaction/compaction.js:
+							// prefer the provider-reported totalTokens, fall back to the 4-component sum.
+							progress.tokens = (u as { totalTokens?: number }).totalTokens
+								|| (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
 						}
 						if (evt.message.model) result.model = evt.message.model;
 						if (evt.message.errorMessage) progress.error = evt.message.errorMessage;
@@ -761,15 +749,15 @@ function renderAgentProgress(
 		renderToolRow(t.tool, t.args, t.children, t.status === "running");
 	}
 
-	// Latest assistant message (prose "thinking") — only at depth 0.
-	// Per spec: deeper levels show tool calls only, no thinking/last-message.
-	if (!nested && prog.lastMessage) {
-		c.addChild(new Spacer(1));
-		if (expanded) {
-			c.addChild(new Text(theme.fg("text", prog.lastMessage), 0, 0));
-		} else {
-			c.addChild(new Text(truncLine(theme.fg("text", prog.lastMessage), w), 0, 0));
-		}
+	// Latest assistant message (prose "thinking"). Rendered at every depth so a
+	// nested subagent's current thought sits at the bottom of its own indented
+	// block, mirroring how the master box shows it under all tool rows. At depth
+	// 0 we precede it with a blank line for visual separation from the tool log;
+	// at depth>=1 we skip the spacer so the row stays grouped with the child's
+	// tool list above and doesn't break the visual run between sibling children.
+	if (prog.lastMessage) {
+		if (!nested) c.addChild(new Spacer(1));
+		addLine(theme.fg("text", prog.lastMessage));
 	}
 
 	// Expanded final output — only at depth 0. Nested levels are summarized via

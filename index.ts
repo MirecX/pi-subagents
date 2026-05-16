@@ -711,16 +711,13 @@ function renderAgentProgress(
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
 	addLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`);
 
-	// Task — only at depth 0. Nested levels are about activity, not restating
-	// the brief (the parent's recentTools row above already shows the dispatch).
-	if (!nested) {
-		if (expanded) {
-			c.addChild(new Text(theme.fg("dim", `Task: ${r.task}`), 0, 0));
-		} else {
-			const flat = r.task.replace(/\n/g, " ");
-			c.addChild(new Text(truncLine(theme.fg("dim", `Task: ${flat}`), w), 0, 0));
-		}
-	}
+	// NOTE: the task body used to be rendered here at depth 0 (truncated when
+	// collapsed, full when expanded). It's now owned by `renderCall` above this
+	// block in the same tool shell — the call header shows the truncated
+	// preview when collapsed and the full streaming prompt when expanded — so
+	// repeating it here would duplicate the prompt on screen. Nested children
+	// never rendered Task in the first place; the parent's recentTools row
+	// above each child already conveys the dispatch.
 
 	// Helper for rendering one tool row + recursively rendering its children.
 	const renderToolRow = (
@@ -876,8 +873,18 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		// ── Render: tool call header ──
-		renderCall(args, theme, _context) {
-			if (args.agent) {
+		//
+		// Two views, toggled by ctrl+o (pi flips `context.expanded` and re-invokes
+		// this on every flip). pi-agent-core also re-invokes this on every streamed
+		// args delta, so in the expanded branch the full task text grows token by
+		// token while the master LLM is still writing the prompt — mirroring how
+		// `write`/`edit` reveal their `content` field live.
+		renderCall(args, theme, context) {
+			// Collapsed view (default): single-line header + 60-char task preview.
+			if (!context.expanded) {
+				if (!args.agent) {
+					return new Text(theme.fg("toolTitle", theme.bold("subagent")), 0, 0);
+				}
 				const taskPreview = args.task
 					? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task).replace(/\n/g, " ")
 					: "";
@@ -886,7 +893,24 @@ export default function (pi: ExtensionAPI) {
 					0, 0,
 				);
 			}
-			return new Text(theme.fg("toolTitle", theme.bold("subagent")), 0, 0);
+
+			// Expanded view: header + full streaming task body. Reuse the previous
+			// Container so we don't allocate on every streamed token (same pattern
+			// the built-in write/edit tools use via context.lastComponent).
+			const c = context.lastComponent instanceof Container
+				? (context.lastComponent.clear(), context.lastComponent)
+				: new Container();
+			const agentLabel = args.agent ? ` ${theme.fg("accent", args.agent)}` : "";
+			const cwdLabel = args.cwd ? theme.fg("dim", ` (cwd: ${args.cwd})`) : "";
+			c.addChild(new Text(`${theme.fg("toolTitle", theme.bold("subagent"))}${agentLabel}${cwdLabel}`, 0, 0));
+			if (args.task) {
+				c.addChild(new Spacer(1));
+				// Plain Text wraps to terminal width. Markdown would also work but
+				// the task prompt is the master's raw instruction text, not authored
+				// markdown, and parsing partial markdown mid-stream looks jittery.
+				c.addChild(new Text(theme.fg("text", args.task), 0, 0));
+			}
+			return c;
 		},
 
 		// ── Render: result ──

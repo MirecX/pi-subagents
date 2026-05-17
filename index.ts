@@ -765,9 +765,9 @@ function renderAgentProgress(
 		c.addChild(new Markdown(r.output, 0, 0, mdTheme));
 	}
 
-	// Usage line. At depth 0 we include the context %/max gauge; deeper levels
-	// drop it (a child's context % isn't actionable from the parent's row, and
-	// the line gets noisy at indent).
+	// Usage line. Includes the context %/max gauge at every depth — each
+	// subagent carries its own model/contextWindow and its own token count, so
+	// the gauge is meaningful per-row even for nested children.
 	if (!nested) c.addChild(new Spacer(1));
 	const usageParts: string[] = [];
 	if (r.usage.input) usageParts.push(theme.fg("dim", `↑${formatTokens(r.usage.input)}`));
@@ -775,7 +775,7 @@ function renderAgentProgress(
 	if (r.usage.cacheRead) usageParts.push(theme.fg("dim", `R${formatTokens(r.usage.cacheRead)}`));
 	if (r.usage.cacheWrite) usageParts.push(theme.fg("dim", `W${formatTokens(r.usage.cacheWrite)}`));
 	if (r.usage.cost) usageParts.push(theme.fg("dim", `$${r.usage.cost.toFixed(3)}`));
-	if (!nested && prog.tokens > 0) {
+	if (prog.tokens > 0) {
 		const ctxStr = formatContextUsage(prog.tokens, r.contextWindow);
 		const pct = r.contextWindow ? (prog.tokens / r.contextWindow) * 100 : 0;
 		const coloredCtx = pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);

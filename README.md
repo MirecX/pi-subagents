@@ -1,12 +1,18 @@
 # Minimal Subagents
 
-A pi extension that registers a single `subagent` tool with three agents:
+A [pi](https://github.com/earendil-works/pi) extension that registers a single `subagent` tool with three agents:
 
 | Agent | Tools | Model | Purpose |
 |-------|-------|-------|---------|
 | **scout** | read, grep, find, ls | claude-haiku-4-5 | Fast codebase recon |
 | **researcher** | web_search, web_fetch | claude-sonnet-4-6 | Web research |
 | **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
+
+`worker` is allowlisted to spawn only `scout` and `researcher` (via `subagent_agents` in its frontmatter), so the chain stops at depth 2 — a worker cannot recurse into another worker.
+
+## Dependencies
+
+`safe_bash` ships in this repo (`tools/safe-bash.ts`). `web_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. Without them the affected agents will launch with an empty tool allowlist and silently do nothing useful.
 
 ## Usage
 
@@ -27,9 +33,18 @@ Optional `config.json` next to `index.ts`:
 { "maxConcurrency": 4 }
 ```
 
+## Output
+
+Subagents return text only — there's no file handoff. If the parent needs artifacts, instruct the subagent to `write` them and return the path.
+
+Large outputs (>`DEFAULT_MAX_BYTES`) are head-truncated before being returned to the parent.
+
 ## UI
 
-Default view shows medium detail (agent status, task preview, recent tools). Expand to see full task, all tool calls, complete output, and token usage.
+Two levels, toggled with `ctrl+o`:
+
+- **Collapsed (default):** the tool call shows one line — `subagent <agent> <60-char task preview>`. The result block shows the agent header (status, tool count, duration), the chronological tool log (one line per call, running calls marked with `▸`), the latest prose "thinking" line, and a usage line (tokens in/out, cache, cost, context-window gauge).
+- **Expanded:** the call header streams the full task body live as the parent writes it (like `write`/`edit`). The result block additionally renders the subagent's full final output as markdown. Nested children (when a worker spawns scout/researcher) render inline, indented under the row that dispatched them, with their own per-row context gauge.
 
 ## Registering Agents from Other Extensions
 
@@ -65,7 +80,7 @@ The markdown body becomes the agent's system prompt.
 Pi loads extensions via jiti, which creates separate module instances. Direct imports from the subagents extension will reference a different `agents` array than the one the `subagent` tool uses. Use the `globalThis` bridge instead:
 
 ```typescript
-import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -74,8 +89,10 @@ interface AgentConfig {
   description: string;
   tools: string[];
   model: string;
+  thinking: string;        // "off" | "low" | "medium" | "high"
   systemPrompt: string;
   filePath: string;
+  subagentAgents?: string[]; // optional spawn-allowlist when `subagent` is in tools
 }
 
 const AGENTS_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), "agents");
@@ -94,14 +111,19 @@ function registerMyAgents(): void {
     if (!frontmatter.name) continue;
 
     const tools = (frontmatter.tools || "").split(",").map(t => t.trim()).filter(Boolean);
+    const subagentAgents = frontmatter.subagent_agents
+      ? frontmatter.subagent_agents.split(",").map(t => t.trim()).filter(Boolean)
+      : undefined;
     try {
       subagents.registerAgent({
         name: frontmatter.name,
         description: frontmatter.description || "",
         tools,
         model: frontmatter.model || "anthropic/claude-sonnet-4-6",
+        thinking: frontmatter.thinking || "medium",
         systemPrompt: body,
         filePath,
+        ...(subagentAgents ? { subagentAgents } : {}),
       });
     } catch {
       // Already registered — skip

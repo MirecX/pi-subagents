@@ -144,8 +144,8 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 // Custom tools that require loading an extension into the subagent process
 const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-	web_search: path.join(EXT_BASE, "web-search", "index.ts"),
-	web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
+	internet_search: path.join(EXT_BASE, "pi-searxng", "dist", "index.js"),
+	web_fetch: path.join(EXT_BASE, "pi-searxng", "dist", "index.js"),
 	safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
 	video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
 	youtube_search: path.join(EXT_BASE, "youtube-search", "index.ts"),
@@ -218,7 +218,7 @@ function loadAgents(): AgentConfig[] {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools,
-			model: frontmatter.model || "anthropic/claude-sonnet-4-6",
+			model: CONFIG.modelOverride || frontmatter.model || "anthropic/claude-sonnet-4-6",
 			thinking: frontmatter.thinking || "medium",
 			systemPrompt: body,
 			filePath,

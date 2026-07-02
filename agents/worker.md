@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, safe_bash, web_search, web_fetch, subagent
+tools: read, write, edit, safe_bash, internet_search, web_fetch, subagent
 subagent_agents: scout, researcher
 model: anthropic/claude-sonnet-4-6
 thinking: medium
@@ -24,7 +24,7 @@ Your context is finite. Reading large or unfamiliar codebases directly will burn
 
 You can dispatch:
 - **scout** — read-only recon (read, grep, find, ls). Returns a structured map of files, line ranges, and key snippets. Cheap (haiku). Use for *exploring unfamiliar territory*.
-- **researcher** — web research (web_search, web_fetch). Returns a sourced brief. Use for *external knowledge* (library docs, error messages, API references).
+- **researcher** — web research (internet_search, web_fetch). Returns a sourced brief. Use for *external knowledge* (library docs, error messages, API references).
 
 ### When to dispatch a scout vs. read directly
 

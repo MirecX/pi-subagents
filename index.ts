@@ -104,6 +104,14 @@ interface ExtensionConfig {
 	 * name resolved under ~/.pi/agent/extensions/<name>/index.ts, or an absolute path.
 	 */
 	extraExtensions?: string[];
+	/**
+	 * Override/extend the map of custom tool name -> extension entry file. Lets a box
+	 * point tools at whatever extension provides them without editing this source. Each
+	 * value is an absolute path, or a path relative to ~/.pi/agent/extensions (e.g.
+	 * "pi-searxng/dist/index.js"). When two tools share the same resolved path (e.g.
+	 * web_search + web_fetch both from a combined extension), the child loads it once.
+	 */
+	toolExtensions?: Record<string, string>;
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -148,6 +156,16 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 	// PI_SUBAGENT_ALLOWED is set) only registers the allowlisted agents.
 	subagent: path.join(EXT_DIR, "index.ts"),
 };
+
+// Effective tool→extension map: config.toolExtensions overrides/extends the defaults.
+// Values are absolute paths or paths relative to EXT_BASE (e.g. "pi-searxng/dist/index.js").
+const TOOL_EXTENSIONS: Record<string, string> = (() => {
+	const merged = { ...CUSTOM_TOOL_EXTENSIONS };
+	for (const [tool, entry] of Object.entries(CONFIG.toolExtensions ?? {})) {
+		merged[tool] = path.isAbsolute(entry) ? entry : path.join(EXT_BASE, entry);
+	}
+	return merged;
+})();
 
 // ── Agent Discovery & Registration ────────────────────────────────────
 
@@ -330,9 +348,9 @@ async function buildPiArgs(
 	for (const tool of agent.tools) {
 		if (BUILTIN_TOOLS.has(tool)) {
 			allowlist.push(tool);
-		} else if (CUSTOM_TOOL_EXTENSIONS[tool]) {
+		} else if (TOOL_EXTENSIONS[tool]) {
 			allowlist.push(tool);
-			extensionPaths.add(CUSTOM_TOOL_EXTENSIONS[tool]);
+			extensionPaths.add(TOOL_EXTENSIONS[tool]);
 		}
 	}
 

@@ -8,9 +8,9 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -90,6 +90,20 @@ interface Details {
 
 interface ExtensionConfig {
 	maxConcurrency?: number;
+	/**
+	 * Override the model for every agent, ignoring each agent's frontmatter `model`.
+	 * Useful when the whole box runs a single local model (e.g. "work/my-model").
+	 */
+	modelOverride?: string;
+	/**
+	 * Extensions to always load into the child subagent process, in addition to the
+	 * ones implied by an agent's tools. Subagents spawn with `--no-extensions`, so any
+	 * extension that registers a *provider/api* the chosen model needs (e.g. the
+	 * `anthropic-no-timeout` api) must be listed here or the child fails with
+	 * "No API provider registered for api: ...". Each entry is either a bare extension
+	 * name resolved under ~/.pi/agent/extensions/<name>/index.ts, or an absolute path.
+	 */
+	extraExtensions?: string[];
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -105,6 +119,15 @@ function loadConfig(): ExtensionConfig {
 		}
 	} catch {}
 	return {};
+}
+
+// Loaded once at module load so top-level functions (e.g. buildPiArgs) can read it.
+const CONFIG: ExtensionConfig = loadConfig();
+
+// Resolve an `extraExtensions` entry to a concrete `--extension` path: absolute paths
+// are used as-is; a bare name resolves to ~/.pi/agent/extensions/<name>/index.ts.
+function resolveExtraExtension(entry: string): string {
+	return path.isAbsolute(entry) ? entry : path.join(EXT_BASE, entry, "index.ts");
 }
 
 // Built-in tools that pi provides natively (no extension needed)
@@ -328,7 +351,15 @@ async function buildPiArgs(
 		args.push("--extension", extPath);
 	}
 
-	args.push("--models", agent.model);
+	// Provider/api extensions the chosen model needs (see ExtensionConfig.extraExtensions).
+	// The child runs with --no-extensions, so these would otherwise be missing and a model
+	// on a custom api (e.g. anthropic-no-timeout) would fail to resolve its provider.
+	for (const entry of CONFIG.extraExtensions ?? []) {
+		const extPath = resolveExtraExtension(entry);
+		if (!extensionPaths.has(extPath)) args.push("--extension", extPath);
+	}
+
+	args.push("--models", CONFIG.modelOverride || agent.model);
 	args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", promptPath);
 
@@ -796,7 +827,7 @@ function renderAgentProgress(
 // ── Extension ─────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
+	const config = CONFIG;
 	const semaphore = new Semaphore(config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
 	agents = loadAgents();
 

@@ -112,6 +112,13 @@ interface ExtensionConfig {
 	 * web_search + web_fetch both from a combined extension), the child loads it once.
 	 */
 	toolExtensions?: Record<string, string>;
+	/**
+	 * Allow the raw `bash` tool inside subagents. Default FALSE: safety-first, agent
+	 * tool lists are force-mapped so `bash` → `safe_bash` (the dangerous-command-
+	 * blocking variant). Set this true only if you understand and accept that a
+	 * subagent could then run arbitrary commands unguarded.
+	 */
+	allowRawBash?: boolean;
 }
 
 const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -281,6 +288,7 @@ function formatToolPreview(name: string, args: Record<string, unknown>): string 
 		case "ls":
 			return `ls ${(args.path as string) || "."}`;
 		case "web_search":
+		case "internet_search":
 			return `search "${(args.query as string) || ""}"`;
 		case "web_fetch":
 			return `fetch ${(args.url as string) || ""}`;
@@ -345,12 +353,18 @@ async function buildPiArgs(
 	const allowlist: string[] = [];
 	const extensionPaths = new Set<string>();
 
+	// Safety-first: map the raw (dangerous) `bash` tool to the `safe_bash` variant
+	// unless the operator explicitly opted in via config.allowRawBash. A subagent is
+	// autonomous, so it should never receive an unguarded shell by accident — an agent
+	// that lists `bash` in its frontmatter gets `safe_bash` with dangerous-command
+	// blocking instead, regardless of how it was declared.
 	for (const tool of agent.tools) {
-		if (BUILTIN_TOOLS.has(tool)) {
-			allowlist.push(tool);
-		} else if (TOOL_EXTENSIONS[tool]) {
-			allowlist.push(tool);
-			extensionPaths.add(TOOL_EXTENSIONS[tool]);
+		const resolved = tool === "bash" && !CONFIG.allowRawBash ? "safe_bash" : tool;
+		if (BUILTIN_TOOLS.has(resolved)) {
+			allowlist.push(resolved);
+		} else if (TOOL_EXTENSIONS[resolved]) {
+			allowlist.push(resolved);
+			extensionPaths.add(TOOL_EXTENSIONS[resolved]);
 		}
 	}
 

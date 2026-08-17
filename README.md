@@ -5,14 +5,14 @@ A [pi](https://github.com/earendil-works/pi) extension that registers a single `
 | Agent | Tools | Model | Purpose |
 |-------|-------|-------|---------|
 | **scout** | read, grep, find, ls | claude-haiku-4-5 | Fast codebase recon |
-| **researcher** | web_search, web_fetch | claude-sonnet-4-6 | Web research |
-| **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
+| **researcher** | internet_search, web_fetch | claude-sonnet-4-6 | Web research |
+| **worker** | read, write, edit, safe_bash, internet_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
 
 `worker` is allowlisted to spawn only `scout` and `researcher` (via `subagent_agents` in its frontmatter), so the chain stops at depth 2 — a worker cannot recurse into another worker.
 
 ## Dependencies
 
-`safe_bash` ships in this repo (`tools/safe-bash.ts`). `web_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. Without them the affected agents will launch with an empty tool allowlist and silently do nothing useful.
+`safe_bash` ships in this repo (`tools/safe-bash.ts`). `internet_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. Without them the affected agents will launch with an empty tool allowlist and silently do nothing useful.
 
 ## Usage
 
@@ -30,8 +30,14 @@ Each subagent runs as an isolated `pi` process with no inherited context — all
 Optional `config.json` next to `index.ts`:
 
 ```json
-{ "maxConcurrency": 4 }
+{
+  "maxConcurrency": 4,
+  "allowRawBash": false
+}
 ```
+
+- `maxConcurrency` — cap on simultaneous subagents (default 4); calls past the cap queue.
+- `allowRawBash` — default `false`. See [Safety](#safety) below.
 
 ## Output
 
@@ -58,7 +64,7 @@ Create markdown files with YAML frontmatter in your extension's directory (e.g. 
 ---
 name: my-agent
 description: Does a specific thing
-tools: web_search, video_extract
+tools: internet_search, video_extract
 model: claude-sonnet-4-20250514
 ---
 
@@ -140,7 +146,7 @@ If your agents need tools beyond the built-in set, those tools must be mapped in
 
 ```typescript
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-  web_search: path.join(EXT_BASE, "web-search", "index.ts"),
+  internet_search: path.join(EXT_BASE, "web-search", "index.ts"),
   web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
   safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
   video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
@@ -152,6 +158,21 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 Built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) work automatically. Any other tool the agent lists in its frontmatter must have a corresponding entry here pointing to the extension's `index.ts`.
 
 The `subagent` tool itself is listed in `CUSTOM_TOOL_EXTENSIONS` pointing back to this extension's own `index.ts` — that's how an agent like `worker` can recursively spawn other agents. Recursion is bounded only by each agent's `subagent_agents` allowlist (e.g. worker can spawn scout/researcher, neither of which declares the `subagent` tool, so the chain stops at depth 2).
+
+## Safety
+
+Subagents run **autonomously**, so this extension is **safety-first by structure, not by convention**:
+
+- **`bash` is never handed to a subagent.** When building a subagent's tool allowlist, the raw `bash` tool is force-remapped to `safe_bash` — the dangerous-command-blocking variant ([tools/safe-bash.ts](tools/safe-bash.ts)) — regardless of what an agent declares in its `tools:` frontmatter or via `registerAgent`. A carelessly-written or third-party agent cannot accidentally get an unguarded shell.
+- **`safe_bash` blocks destructive/system/hijack commands** via a hardcoded blocklist: broad recursive deletes (`rm -rf /`, `~`, `.`, `*`, `$HOME`), `git clean -fdx`/`git reset --hard`, privilege escalation (`sudo`, `chmod 777 /`, `chown root`, `useradd`), filesystem/device writes (`mkfs`, `fdisk`, `dd`, `/dev/` and `/etc/` redirection), reverse shells and remote code execution (`/dev/tcp`, `nc -e`, `curl|sh`, fork bomb), and power/service disruption (`shutdown`, `reboot`, `pkill -9`). See the file for the full list.
+- **The blocklist is a heuristic, not a sandbox.** It catches known-dangerous patterns but cannot stop every novel command or prevent data exfiltration (e.g. `curl` uploading your files). It is defense-in-depth on top of container isolation — do not rely on it as the only boundary.
+- **Opt out only if you must.** Set `"allowRawBash": true` in `config.json` to give agents the unfiltered `bash` tool. Not recommended; only for an environment you fully trust.
+
+### Sanity checklist for a custom agent
+
+- Give it the **narrowest** `tools:` list it needs. No bash? No shell tool at all.
+- If it needs a shell, write `safe_bash` (or just `bash` — it will be remapped to `safe_bash` automatically).
+- An agent that only reads (`scout`) or only researches the web (`researcher`) has **no shell at all** — good defaults.
 
 ## Structure
 
